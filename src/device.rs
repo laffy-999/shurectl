@@ -12,7 +12,7 @@
 //! audio interface. hidapi opens it via /dev/hidrawN on Linux, IOKit on macOS,
 //! and \\.\HID#VID_... paths on Windows, bypassing the audio driver entirely.
 //!
-//! # Transport
+//! # Reports
 //!
 //! Configuration uses plain HID Output/Input reports:
 //!   - `hid_write()` sends a command to the device (Output report).
@@ -28,9 +28,8 @@
 //!
 //! # Sequence numbers
 //!
-//! Each packet carries an incrementing sequence number (0–255, wrapping). The
-//! device echoes this number in its response. We track it in `ShureDevice` and
-//! increment after every `write()`.
+//! Each binary packet carries an incrementing sequence number (0–255, wrapping).
+//! `ShureDevice::next_seq()` hands out one per packet built, CONFIRMs included.
 //!
 //! # Transport
 //!
@@ -99,8 +98,9 @@ const MV7_REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 const MV7_DRAIN_MAX_REPORTS: usize = 256;
 
 /// A HID read or write failed, or `reopen()` could not find the device: it was
-/// unplugged or its handle went stale. Kept as its own type so `main.rs` can tell it apart from a device
-/// that is present but refused a command, and show the device as disconnected.
+/// unplugged or its handle went stale. Kept as its own type so `main.rs` can
+/// tell it apart from a device that is present but refused a command, and show
+/// the device as disconnected.
 #[derive(Debug)]
 pub struct Disconnected(pub String);
 
@@ -511,16 +511,13 @@ impl ShureDevice {
     /// an error (the device is gone). A timeout or an unrecognised reply is
     /// recorded in `readback`, and fails it when the readback finishes.
     fn query(&self, pkt: &[u8], readback: &mut Readback) -> Result<()> {
-        let reply = self.send_get(pkt)?;
-        readback.apply(self.model, pkt, reply.as_ref(), Need::Required);
-        Ok(())
+        self.query_as(pkt, Need::Required, readback)
     }
 
-    /// [`Self::query`] for a GET not checked on this model's hardware: without
-    /// a usable reply, its setting is only noted in [`Readback::skipped`].
-    fn query_optional(&self, pkt: &[u8], readback: &mut Readback) -> Result<()> {
+    /// [`Self::query`] for a GET that may go unanswered, as `need` says.
+    fn query_as(&self, pkt: &[u8], need: Need, readback: &mut Readback) -> Result<()> {
         let reply = self.send_get(pkt)?;
-        readback.apply(self.model, pkt, reply.as_ref(), Need::Optional);
+        readback.apply(self.model, pkt, reply.as_ref(), need);
         Ok(())
     }
 
@@ -543,6 +540,7 @@ impl ShureDevice {
     /// Fetch the complete device state by querying every feature for this model.
     pub fn get_state(&self) -> Result<Readback> {
         let mut readback = Readback::default();
+        readback.state.mute_btn_disabled = None;
         match self.model {
             DeviceModel::Mvx2u => self.get_state_mvx2u(&mut readback),
             DeviceModel::Mvx2uGen2 => self.get_state_mvx2u_gen2(&mut readback),
@@ -641,7 +639,7 @@ impl ShureDevice {
         // stop every write.
         let playback_mix = cmd_get_mv7_playback_mix(self.next_seq());
         match self.model {
-            DeviceModel::Mv6 => self.query_optional(&playback_mix, readback)?,
+            DeviceModel::Mv6 => self.query_as(&playback_mix, Need::Optional, readback)?,
             DeviceModel::Mvx2u
             | DeviceModel::Mvx2uGen2
             | DeviceModel::Mv6Gen2
@@ -685,7 +683,20 @@ impl ShureDevice {
             cmd_get_mv6_denoiser,
             cmd_get_mv6_popper_stopper,
             cmd_get_mv6_tone,
-            cmd_get_mv6_mute_btn_disable,
+        ];
+        self.run_getters(getters, readback)?;
+        // The MV7+ has this setting from firmware 1.4.0, and 1.3.0.13 answers
+        // the GET with an unrecognised reply (see cmd_get_mv6_mute_btn_disable()).
+        // Do not guess the button state: it stays None.
+        let skipped_before_mute_button = readback.skipped.len();
+        self.query_as(
+            &cmd_get_mv6_mute_btn_disable(self.next_seq()),
+            Need::Optional,
+            readback,
+        )?;
+        let mute_button_note = (readback.skipped.len() > skipped_before_mute_button)
+            .then_some(skipped_before_mute_button);
+        let getters: &[fn(u8) -> Vec<u8>] = &[
             cmd_get_mv6_mix, // Mic Level (prefix=0x00)
             cmd_get_mv7_playback_mix,
             cmd_get_mv7_reverb_output,
@@ -706,7 +717,18 @@ impl ShureDevice {
             cmd_get_firmware_version,
             cmd_get_serial,
         ];
-        self.run_getters(getters, readback)
+        self.run_getters(getters, readback)?;
+        // Firmware is read above without changing GET order. On firmware that
+        // predates the setting, its card says so, so it isn't a read error.
+        if let Some(index) = mute_button_note
+            && readback
+                .state
+                .mute_button_needs_firmware(self.model)
+                .is_some()
+        {
+            readback.skipped.remove(index);
+        }
+        Ok(())
     }
 
     /// Read just the factory serial number (the serial printed on the device,
@@ -810,7 +832,7 @@ impl ShureDevice {
         self.send_set(&pkt)
     }
 
-    // ── MVX2U-first SET commands (Auto Level, mix, dynamics, EQ, lock) ──────
+    // ── MVX2U-first SET commands (Auto Level, dynamics, EQ, lock) ───────────
 
     /// Set the Auto Level mic position. `tone` is only used by the MV7, which
     /// stores both in one setting.
@@ -911,7 +933,7 @@ impl ShureDevice {
         }
     }
 
-    // ── MV6-first SET commands (also MVX2U Gen 2, MV6 Gen 2, MV7+) ──────────
+    // ── MV6-first and MV6 Gen 2 SET commands, device name, Monitor Mix ──────
 
     pub fn set_mv6_denoiser(&self, enabled: bool) -> Result<()> {
         let pkt = match self.model {
@@ -1221,7 +1243,8 @@ pub struct Readback {
 #[derive(Clone, Copy)]
 enum Need {
     Required,
-    /// Unconfirmed on the model's hardware, so it may never be answered.
+    /// Unconfirmed on the model's hardware, or missing from some firmware:
+    /// noted in [`Readback::skipped`].
     Optional,
 }
 
@@ -1285,9 +1308,12 @@ fn supported_model(info: &hidapi::DeviceInfo) -> Option<DeviceModel> {
     DeviceModel::from_pid(info.product_id())
 }
 
+/// The lowest vendor-defined HID usage page.
+const VENDOR_USAGE_PAGE_MIN: u16 = 0xFF00;
+
 /// Enumerate supported Shure devices, one entry per physical device.
 ///
-/// Two-pass approach:
+/// Three steps:
 /// 1. Filter to VID/PID candidates.
 /// 2. If any candidate advertises a vendor-defined HID usage page (0xFF00–0xFFFF),
 ///    restrict to those — this drops the Windows telephony/mute-button collection
@@ -1296,8 +1322,6 @@ fn supported_model(info: &hidapi::DeviceInfo) -> Option<DeviceModel> {
 ///    that case no candidate looks vendor-defined, so all are kept and step 3
 ///    handles deduplication.
 /// 3. Deduplicate by path — on Linux all collections share one /dev/hidrawN path.
-const VENDOR_USAGE_PAGE_MIN: u16 = 0xFF00;
-
 fn shure_devices(api: &HidApi) -> Vec<(&hidapi::DeviceInfo, DeviceModel)> {
     let candidates: Vec<(&hidapi::DeviceInfo, DeviceModel)> = api
         .device_list()

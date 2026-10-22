@@ -10,12 +10,12 @@
 //!
 //! Binary models: a SET is stored when its CONFIRM arrives, a GET is answered from
 //! the store, and each CONFIRM queues the acks `fake_wire::acks_after_confirm()`
-//! lists for the model, one of which parses as a reply on the MV7+. A packet with
-//! the wrong header byte for its command, or a sequence byte that doesn't follow
-//! the previous one on its handle, is refused. The MV7 runs
-//! `mv7_text::shell` instead. Faults (dropped or extra acks, failed I/O, refused
-//! commands, unplugging) give disconnect and readback-order tests something to
-//! bite on. Every packet received is logged, decoded by name.
+//! lists for the model, one of which parses as a reply on every binary model but
+//! the MVX2U Gen 2. A packet with the wrong header byte for its command, or a
+//! sequence byte that doesn't follow the previous one on its handle, is refused.
+//! The MV7 runs `mv7_text::shell` instead. Faults (dropped or extra acks, failed
+//! I/O, refused commands, unplugging) give disconnect and readback-order tests
+//! something to bite on. Every packet received is logged, decoded by name.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -102,6 +102,11 @@ pub struct Faults {
     pub fail_io: bool,
     /// Commands to answer with an unknown address (binary) or `[Failed]` (MV7).
     pub refuse: usize,
+    /// Feature whose GETs are answered with an unknown address, as `refuse`
+    /// does, until cleared.
+    pub refused_get: Option<String>,
+    /// Firmware version for FIRMWARE GETs to answer with, until cleared.
+    pub firmware_version: Option<String>,
 }
 
 type ValueOf = Box<dyn Fn(&DeviceState) -> Vec<u8>>;
@@ -297,7 +302,7 @@ fn features(model: DeviceModel) -> Vec<Feature> {
         ),
         set_feature(
             "MUTE_BUTTON",
-            |s| cmd_set_mv6_mute_btn_disable(0, s.mute_btn_disabled),
+            |s| cmd_set_mv6_mute_btn_disable(0, s.mute_btn_disabled.unwrap_or_default()),
             Some(|s| json!(s.mute_btn_disabled)),
         ),
         set_feature(
@@ -615,18 +620,34 @@ impl FakeState {
         match request {
             Request::Get(key) => {
                 let feature = self.feature_name(key);
+                let refused = if self.faults.refused_get.as_deref() == Some(feature.as_str()) {
+                    true
+                } else if self.faults.refuse > 0 {
+                    self.faults.refuse -= 1;
+                    true
+                } else {
+                    false
+                };
+                let firmware_version = (feature == "FIRMWARE")
+                    .then_some(self.faults.firmware_version.as_deref())
+                    .flatten();
                 self.log.push(Packet {
                     raw,
                     kind: PacketKind::Get { feature },
                 });
-                if self.faults.refuse > 0 {
-                    self.faults.refuse -= 1;
+                if refused {
                     let unknown = Key {
                         addr: UNKNOWN_ADDR,
                         ..key
                     };
                     self.input
                         .push_back(fake_wire::reply(seq, unknown, &[0x00]));
+                } else if let Some(version) = firmware_version {
+                    self.input.push_back(fake_wire::reply(
+                        seq,
+                        key,
+                        &fake_wire::lp_string(version),
+                    ));
                 } else if let Some(value) = self.store.get(&key) {
                     self.input.push_back(fake_wire::reply(seq, key, value));
                 }
@@ -686,7 +707,8 @@ impl FakeState {
         }
     }
 
-    /// A gain-locked device ignores gain writes (checked on hardware).
+    /// A gain-locked device ignores gain writes (tested on the MV6, MV6 Gen 2
+    /// and MVX2U Gen 2, 2026-10-10).
     fn gain_locked_write(&self, key: Key) -> bool {
         let (Some(gain), Some(lock)) = (self.key_of("GAIN"), self.key_of("GAIN_LOCK")) else {
             return false;
@@ -922,7 +944,7 @@ mod tests {
             locked: true,
             denoiser_enabled: true,
             popper_stopper_enabled: false,
-            mute_btn_disabled: true,
+            mute_btn_disabled: Some(true),
             tone: -4,
             mv6_gain_locked: true,
             adaptation_rate_fast: true,
@@ -998,6 +1020,20 @@ mod tests {
                 );
             }
             assert_eq!(readback.state.factory_serial, "FAKE0001", "{model:?}");
+        }
+    }
+
+    #[test]
+    fn refused_required_get_still_fails_readback() {
+        for (model, feature, label) in [
+            (DeviceModel::Mv7Plus, "GAIN", "Gain"),
+            (DeviceModel::Mv6, "MUTE_BUTTON", "Mute Button"),
+            (DeviceModel::Mv6Gen2, "MUTE_BUTTON", "Mute Button"),
+        ] {
+            let fake = FakeDevice::new(model);
+            fake.faults_mut(|faults| faults.refused_get = Some(feature.into()));
+            let error = fake.open().get_state().err().expect("readback must fail");
+            assert!(error.to_string().contains(label), "{model:?}: {error}");
         }
     }
 

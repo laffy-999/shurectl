@@ -118,7 +118,8 @@ Intended differences (hardware, not divergence; don't flag them):
 - EQ band steps: 0.5 dB on the MVX2U Gen 2, 2 dB on the Gen 1 and MV6 Gen 2
 - "Monitor Mix" (a balance) on the MVX2U Gen 1 and MV7; "Mic Level" on models with Playback Level
 - "Auto Gain" (MVX2U Gen 1) and "Target Level" (MV6 Gen 2): one setting at FEAT_AUTO_GAIN,
-  labelled per model as MOTIV does (MOTIV screenshots; Gen 1 values per shux)
+  labelled per model, as MOTIV labels it Gain (Quieter / Normal / Louder) on the Gen 1 and
+  Target Level on the MV6 Gen 2 (MOTIV screenshots; Gen 1 values per shux)
 - EQ and Dynamics locked in Auto only on the MVX2U Gen 1 and MV7 (`is_tab_locked()`)
 - Tabs and controls hidden per model, as the readme's Device support table lists
 
@@ -216,8 +217,10 @@ rather than promoting a lower one.
 - **Readback order**: changing a `getters` slice, `reports_after_confirm()`, or reply routing
   can shift every later GET by one packet (481dc76). Replies route by address. The prefix
   byte routes only FEAT_MIX 0x03 (Playback Mix), confirmed on the MV6 Gen 2 and MVX2U Gen 2.
-  `get_state()` fails unless every GET got a usable reply, so no field is left at its default
-  (36 dB gain). `query_optional()` is only for a GET unchecked on that model's hardware.
+  `get_state()` fails unless every required GET got a usable reply, so no writable field is
+  left at its default (36 dB gain). `query_as()` with `Need::Optional` is for a GET unchecked
+  on that model's hardware or missing from some firmware. Its field must then be an `Option`
+  left `None` (Mute Button), so nothing shows, saves or writes a default.
 - **Gain Lock**: a locked device ignores gain writes. `apply_binary_preset()` unlocks,
   writes the gain, then re-locks straight away (835c213, 551a5ae). Don't reorder it.
 - **New `PresetSlot` field**: files saved before it existed, or on a model without it, must

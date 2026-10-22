@@ -25,7 +25,7 @@
 //!   [0x70]              Data start marker
 //!   [data_len]          Length of data section (repeated)
 //!   [cmd0][cmd1][cmd2]  3-byte command
-//!   [payload...]        Feature address + value bytes
+//!   [payload...]        Prefix byte, feature address, value bytes
 //!   [crc_hi][crc_lo]    CRC-16/ANSI over all bytes from [0x11] onward (excl. CRC itself)
 //!   [0x00 ...]          Zero padding to reach 64 bytes total
 //!
@@ -65,7 +65,8 @@
 //!                                   both 1-byte and 4-byte responses defensively.
 //!   Monitor mix:    [0x01, 0x86]  — 1 byte: 0=full mic, 100=full playback
 //!   EQ master:      [0x02, 0x00]  — 1 byte: 0=bypass, 1=enabled
-//!   EQ band enable: [0x02, 0xN0]  — 1 byte: 0=off, 1=on  (N = 1,2,3,4,5 per band)
+//!   EQ band enable: [0x02, 0xN0]  — 1 byte: 0=off, 1=on  (N = 1,2,3,4,5 per band), per
+//!                                   shux (no Gen 1 probe output)
 //!   EQ band gain:   [0x02, 0xN4]  — Gen 1: 16-bit signed big-endian, units: gain_db * 10
 //!                                   Gen 2: 8-bit signed (i8), units: gain_db * 10
 //!                                   Same address; wire width distinguishes the model.
@@ -266,6 +267,19 @@ impl DeviceModel {
         match self {
             DeviceModel::Mv6 | DeviceModel::Mv6Gen2 | DeviceModel::Mvx2uGen2 => true,
             DeviceModel::Mvx2u | DeviceModel::Mv7 | DeviceModel::Mv7Plus => false,
+        }
+    }
+
+    /// The first firmware with the Mute Button setting, on a model that got it
+    /// in an update. `None` where every firmware has it, or the model lacks it.
+    pub fn mute_button_firmware(&self) -> Option<&'static str> {
+        match self {
+            DeviceModel::Mv7Plus => Some(MV7_PLUS_MUTE_BUTTON_FIRMWARE),
+            DeviceModel::Mvx2u
+            | DeviceModel::Mvx2uGen2
+            | DeviceModel::Mv6
+            | DeviceModel::Mv6Gen2
+            | DeviceModel::Mv7 => None,
         }
     }
 
@@ -670,8 +684,11 @@ pub struct DeviceState {
     /// confirmed by MOTIV app probe diff.
     pub popper_stopper_enabled: bool,
     /// Mute button disable. MV6, MV6 Gen 2, MV7+. Address [0x0C, 0x00] confirmed
-    /// by Wireshark capture. GET uses CMD_GET_LOCK with inverted encoding.
-    pub mute_btn_disabled: bool,
+    /// by Wireshark capture on the MV6; the MV7+ has it from firmware 1.4.0 (see
+    /// `cmd_get_mv6_mute_btn_disable()`). GET uses CMD_GET_LOCK with inverted
+    /// encoding. `None` until a readback reads it: unknown, so it must not be
+    /// shown, changed or saved in a preset.
+    pub mute_btn_disabled: Option<bool>,
     /// Tone character. MV6, MV6 Gen 2, MVX2U Gen 2, MV7+. Range: -10 to +10
     /// (displayed as × 10%). -10 = 100% Dark, 0 = Natural, +10 = 100% Bright.
     pub tone: i8,
@@ -761,7 +778,8 @@ impl Default for DeviceState {
             // MV6 defaults match factory reset state observed in MOTIV app.
             denoiser_enabled: false,
             popper_stopper_enabled: true,
-            mute_btn_disabled: false,
+            // Demo state is editable; a hardware readback starts it at None.
+            mute_btn_disabled: Some(false),
             tone: 0, // Natural
             mv6_gain_locked: false,
             // MV6 Gen 2 factory defaults, read back after a MOTIV reset.
@@ -798,7 +816,40 @@ impl Default for DeviceState {
     }
 }
 
+/// Shure's MV7+ release notes list "Disable hardware mute feature" as new in
+/// firmware 1.4.0 (2025-09-12). Firmware 1.3.0.13 doesn't answer its GET
+/// (read-only probe, 2026-10-19); 1.6.0.1 reads and writes it (tested
+/// 2026-10-20).
+const MV7_PLUS_MUTE_BUTTON_FIRMWARE: &str = "1.4.0";
+
+/// A firmware version of three or four dot-separated numbers, padded to four,
+/// so versions compare in order. `None` for anything else ("Unknown").
+fn parse_firmware(version: &str) -> Option<[u32; 4]> {
+    let mut parts = [0_u32; 4];
+    let mut count = 0;
+    for part in version.split('.') {
+        if count == parts.len() || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        parts[count] = part.parse().ok()?;
+        count += 1;
+    }
+    (count >= 3).then_some(parts)
+}
+
 impl DeviceState {
+    /// The firmware the Mute Button needs, when it is unread and the installed
+    /// firmware is known to predate it. A successful GET stays authoritative,
+    /// and an unread setting on newer or unknown firmware is a read failure.
+    pub fn mute_button_needs_firmware(&self, model: DeviceModel) -> Option<&'static str> {
+        let required = model.mute_button_firmware()?;
+        if self.mute_btn_disabled.is_some() {
+            return None;
+        }
+        let installed = parse_firmware(&self.firmware_version)?;
+        (installed < parse_firmware(required)?).then_some(required)
+    }
+
     /// The serial number to show the user: the factory serial (printed on the
     /// device, shown in the MOTIV app) when the device reported one, otherwise the
     /// USB descriptor serial as a fallback so the field is never blank.
@@ -1496,7 +1547,7 @@ pub fn crc16_ansi(data: &[u8]) -> u16 {
 ///
 /// `seq` is the per-packet sequence number (0–255, wraps).
 /// `cmd` is the 3-byte command (e.g. [`CMD_GET_FEAT`], [`CMD_SET_FEAT`], [`CMD_CONFIRM`]).
-/// `payload` is the feature address + optional value bytes.
+/// `payload` is the prefix byte, the feature address and any value bytes.
 ///
 /// Layout produced (before CRC + padding):
 /// ```text
@@ -1923,8 +1974,10 @@ pub mod fake_wire {
 
 /// Like `build_packet` but uses HDR_CONSTANT=0x00 instead of 0x03.
 ///
-/// Required for ALL MV7+ SET commands. The MV7+ rejects SET packets with
-/// the standard HDR_CONSTANT=0x03. GET commands still use `build_packet`.
+/// Used for ALL MV7+ SET commands, as MOTIV sends them (capture, firmware 1.6),
+/// and for the commands other models share with it. That the MV7+ refuses a SET
+/// with the standard HDR_CONSTANT=0x03 is unconfirmed. GET commands still use
+/// `build_packet`.
 fn build_packet_hdr0(seq: u8, cmd: &[u8; 3], payload: &[u8]) -> Vec<u8> {
     build_packet_with_hdr(seq, 0x00, cmd, payload)
 }
@@ -2036,8 +2089,11 @@ pub fn cmd_get_mv6_mix(seq: u8) -> Vec<u8> {
 /// Uses CMD_GET_LOCK class with payload [addr_hi=0x0C, addr_lo=0x00, mix_byte=0x60].
 /// parse_response will return feat_addr=[0x00, 0x60] (MV6_FEAT_MUTE_BTN_DISABLE_RESP)
 /// with value[0]: 0x00=button disabled, 0x01=button active (inverted encoding).
-/// Confirmed reliable by Wireshark — device correctly reflects current state.
-/// Also used for the MV6 Gen 2 and MV7+ — the framing is identical.
+/// Confirmed reliable by Wireshark on the MV6, where the device reflected the
+/// current state; the MV6 Gen 2 probe in 2.9.0 matched the address. The MV7+
+/// has the setting from firmware 1.4.0 (`MV7_PLUS_MUTE_BUTTON_FIRMWARE`): this
+/// GET read it on 1.6.0.1, and 1.3.0.13 answered it with an unrecognised
+/// 09 02 01 reply, so its readback is optional there.
 pub fn cmd_get_mv6_mute_btn_disable(seq: u8) -> Vec<u8> {
     let payload = [
         MV6_FEAT_MUTE_BTN_DISABLE[0],
@@ -2697,7 +2753,7 @@ pub fn apply_response(feat_addr: [u8; 2], value: &[u8], state: &mut DeviceState)
                 return false;
             }
             // Inverted encoding: 0x00=button disabled, 0x01=button active.
-            state.mute_btn_disabled = value[0] == 0x00;
+            state.mute_btn_disabled = Some(value[0] == 0x00);
             true
         }
         f if f == MV6_GEN2_FEAT_ADAPTATION_RATE => {
@@ -3129,8 +3185,9 @@ pub mod mv7_text {
 
     // ── Preset loading ────────────────────────────────────────────────────────
     //
-    // The MV7 answers [Failed] to a SET that changes nothing, so a preset load
-    // only sends what differs from the mic's current state.
+    // The MV7 answers [Failed] to a SET that changes nothing (seen for gain and
+    // Monitor Mix, assumed for the rest), so a preset load only sends what
+    // differs from the mic's current state.
 
     /// The `dspMode` SET that takes the mic from `current` to `target`'s mode,
     /// mic position and tone, or `None` if they already match. Changing it has
@@ -3977,6 +4034,42 @@ pub mod mv7_text {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mute_button_firmware_requirement_is_only_for_known_older_mv7plus() {
+        for (firmware, needs_firmware) in [
+            ("1.3.0.13", true),
+            ("1.3.0", true),
+            ("1.3.99.0", true),
+            ("1.4.0", false),
+            ("1.4.0.1", false),
+            ("1.6.0.1", false),
+            ("1.10.0", false),
+            ("2.0.0", false),
+            ("Unknown", false),
+            ("1.3", false),
+            ("1.3.0.bad", false),
+            ("1.3.0.0.1", false),
+            ("1.3.4294967296", false),
+        ] {
+            let state = DeviceState {
+                firmware_version: firmware.into(),
+                mute_btn_disabled: None,
+                ..DeviceState::default()
+            };
+            assert_eq!(
+                state.mute_button_needs_firmware(DeviceModel::Mv7Plus),
+                needs_firmware.then_some("1.4.0"),
+                "{firmware}"
+            );
+            assert_eq!(state.mute_button_needs_firmware(DeviceModel::Mv6), None);
+            let state = DeviceState {
+                mute_btn_disabled: Some(false),
+                ..state
+            };
+            assert_eq!(state.mute_button_needs_firmware(DeviceModel::Mv7Plus), None);
+        }
+    }
+
     /// Two labels on one address would name one setting for the other.
     #[test]
     fn get_labels_name_distinct_queries() {
@@ -4216,8 +4309,6 @@ mod tests {
         assert_eq!(&gain_pkt_g2[14..16], &[0x02u8, 0x14]);
     }
 
-    // ── parse_response ────────────────────────────────────────────────────────
-
     // ── Golden packets ────────────────────────────────────────────────────────
     //
     // Full literal byte sequences for four representative packets. Every other
@@ -4314,6 +4405,8 @@ mod tests {
         );
         assert_eq!(pkt.len(), PACKET_SIZE);
     }
+
+    // ── parse_response ────────────────────────────────────────────────────────
 
     /// Build a synthetic response from the device for testing parse_response.
     fn make_response(seq: u8, resp_cmd: &[u8; 3], feat_addr: &[u8; 2], value: &[u8]) -> Vec<u8> {
@@ -5073,7 +5166,7 @@ mod tests {
                 bytes,
                 &mut state
             ));
-            assert_eq!(state.mute_btn_disabled, expected_disabled);
+            assert_eq!(state.mute_btn_disabled, Some(expected_disabled));
         }
     }
 
